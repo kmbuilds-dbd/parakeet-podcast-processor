@@ -56,6 +56,28 @@ The CLI (`p3/cli.py`) is a Click group command. Each subcommand instantiates the
 
 6. **`database.py`** - `P3Database`: DuckDB storage layer with context manager support. Schema: `podcasts` -> `episodes` -> `transcripts` + `summaries`. Uses sequences for auto-increment IDs. Episode status tracks pipeline progress: `downloaded` -> `transcribed` -> `processed`. Query results are mapped to dicts via cursor column names. Indexes on `episodes(status, url)`, `transcripts(episode_id)`, `summaries(digest_date, episode_id)`.
 
+## Web Frontend
+
+The project has a web UI built with **FastAPI** (backend) + **React/Vite/Tailwind** (frontend).
+
+```bash
+# Install web dependencies
+pip install -e ".[web]"
+cd frontend && npm install && cd ..
+
+# Run both servers for development
+uvicorn p3.api.main:app --reload          # API at http://127.0.0.1:8000
+cd frontend && npm run dev                 # UI at http://localhost:5173 (proxies /api)
+
+# Production build
+cd frontend && npm run build               # Builds to frontend/dist/
+uvicorn p3.api.main:app                    # Serves both API and frontend
+```
+
+**Backend** (`p3/api/`): FastAPI app with routers for podcasts, episodes, jobs, transcripts, summaries, exports, blogs, settings. Background tasks wrap existing P3 modules via `tasks.py` with job tracking in a `jobs` DuckDB table. Shared DB instance and config loading in `deps.py`.
+
+**Frontend** (`frontend/`): React SPA with pages for Dashboard, Add Podcast, Podcast Detail, Episode Detail (with transcript/summary tabs), Blog Posts, and Settings. Job progress polling via `useJobPoller` hook. API client in `src/api/client.js`.
+
 ## Configuration
 
 `config/feeds.yaml` controls feeds and all settings. Key settings:

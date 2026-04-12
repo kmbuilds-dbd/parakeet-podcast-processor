@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import uuid
 from datetime import datetime
 from typing import Dict, List, Optional, Any
 import duckdb
@@ -105,12 +106,30 @@ class P3Database:
             )
         """)
 
+        # Jobs table for background task tracking
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS jobs (
+                id VARCHAR PRIMARY KEY,
+                episode_id INTEGER,
+                job_type VARCHAR NOT NULL,
+                status VARCHAR DEFAULT 'pending',
+                progress REAL DEFAULT 0.0,
+                message VARCHAR,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+
         # Indexes for common query patterns
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_status ON episodes(status)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_url ON episodes(url)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_transcripts_episode_id ON transcripts(episode_id)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_summaries_digest_date ON summaries(digest_date)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_summaries_episode_id ON summaries(episode_id)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_episode_id ON jobs(episode_id)")
 
     def add_podcast(self, title: str, rss_url: str, category: str = None) -> int:
         """Add new podcast feed."""
@@ -233,6 +252,180 @@ class P3Database:
                 if isinstance(row[col], str):
                     row[col] = json.loads(row[col])
         return rows
+
+    # ------------------------------------------------------------------
+    # Podcast helpers
+    # ------------------------------------------------------------------
+
+    def get_podcast_by_id(self, podcast_id: int) -> Optional[Dict[str, Any]]:
+        """Get podcast by ID."""
+        cursor = self.conn.execute("SELECT * FROM podcasts WHERE id = ?", (podcast_id,))
+        return self._fetchone_as_dict(cursor)
+
+    def get_all_podcasts(self) -> List[Dict[str, Any]]:
+        """Get all podcasts."""
+        cursor = self.conn.execute("SELECT * FROM podcasts ORDER BY created_at DESC")
+        return self._fetchall_as_dicts(cursor)
+
+    def delete_podcast(self, podcast_id: int):
+        """Delete a podcast and all related data."""
+        # Delete in dependency order
+        self.conn.execute("""
+            DELETE FROM summaries WHERE episode_id IN
+                (SELECT id FROM episodes WHERE podcast_id = ?)
+        """, (podcast_id,))
+        self.conn.execute("""
+            DELETE FROM transcripts WHERE episode_id IN
+                (SELECT id FROM episodes WHERE podcast_id = ?)
+        """, (podcast_id,))
+        self.conn.execute("DELETE FROM episodes WHERE podcast_id = ?", (podcast_id,))
+        self.conn.execute("DELETE FROM podcasts WHERE id = ?", (podcast_id,))
+
+    # ------------------------------------------------------------------
+    # Episode helpers
+    # ------------------------------------------------------------------
+
+    def get_episodes_by_podcast(self, podcast_id: int) -> List[Dict[str, Any]]:
+        """Get all episodes for a podcast."""
+        cursor = self.conn.execute("""
+            SELECT e.*, p.title as podcast_title
+            FROM episodes e
+            JOIN podcasts p ON e.podcast_id = p.id
+            WHERE e.podcast_id = ?
+            ORDER BY e.date DESC
+        """, (podcast_id,))
+        return self._fetchall_as_dicts(cursor)
+
+    def get_all_episodes(self) -> List[Dict[str, Any]]:
+        """Get all episodes with podcast title."""
+        cursor = self.conn.execute("""
+            SELECT e.*, p.title as podcast_title
+            FROM episodes e
+            JOIN podcasts p ON e.podcast_id = p.id
+            ORDER BY e.date DESC
+        """)
+        return self._fetchall_as_dicts(cursor)
+
+    # ------------------------------------------------------------------
+    # Summary helpers
+    # ------------------------------------------------------------------
+
+    def get_summary_by_episode(self, episode_id: int) -> Optional[Dict[str, Any]]:
+        """Get summary for a specific episode."""
+        cursor = self.conn.execute("""
+            SELECT s.*, e.title as episode_title, p.title as podcast_title
+            FROM summaries s
+            JOIN episodes e ON s.episode_id = e.id
+            JOIN podcasts p ON e.podcast_id = p.id
+            WHERE s.episode_id = ?
+            ORDER BY s.created_at DESC
+            LIMIT 1
+        """, (episode_id,))
+        row = self._fetchone_as_dict(cursor)
+        if row:
+            for col in ('key_topics', 'themes', 'quotes', 'startups'):
+                if isinstance(row[col], str):
+                    row[col] = json.loads(row[col])
+        return row
+
+    def get_all_summaries(self) -> List[Dict[str, Any]]:
+        """Get all summaries."""
+        cursor = self.conn.execute("""
+            SELECT s.*, e.title as episode_title, p.title as podcast_title
+            FROM summaries s
+            JOIN episodes e ON s.episode_id = e.id
+            JOIN podcasts p ON e.podcast_id = p.id
+            ORDER BY s.created_at DESC
+        """)
+        rows = self._fetchall_as_dicts(cursor)
+        for row in rows:
+            for col in ('key_topics', 'themes', 'quotes', 'startups'):
+                if isinstance(row[col], str):
+                    row[col] = json.loads(row[col])
+        return rows
+
+    # ------------------------------------------------------------------
+    # Job tracking
+    # ------------------------------------------------------------------
+
+    def create_job(self, job_type: str, episode_id: int = None) -> str:
+        """Create a new background job. Returns the job ID."""
+        job_id = str(uuid.uuid4())
+        self.conn.execute("""
+            INSERT INTO jobs (id, episode_id, job_type, status)
+            VALUES (?, ?, ?, 'pending')
+        """, (job_id, episode_id, job_type))
+        return job_id
+
+    def update_job(self, job_id: str, status: str = None, progress: float = None,
+                   message: str = None, error: str = None):
+        """Update job status/progress."""
+        parts = []
+        params = []
+        if status is not None:
+            parts.append("status = ?")
+            params.append(status)
+            if status == 'running':
+                parts.append("started_at = CURRENT_TIMESTAMP")
+            elif status in ('completed', 'failed'):
+                parts.append("completed_at = CURRENT_TIMESTAMP")
+        if progress is not None:
+            parts.append("progress = ?")
+            params.append(progress)
+        if message is not None:
+            parts.append("message = ?")
+            params.append(message)
+        if error is not None:
+            parts.append("error = ?")
+            params.append(error)
+        if not parts:
+            return
+        params.append(job_id)
+        self.conn.execute(f"UPDATE jobs SET {', '.join(parts)} WHERE id = ?", params)
+
+    def get_job(self, job_id: str) -> Optional[Dict[str, Any]]:
+        """Get a single job by ID."""
+        cursor = self.conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,))
+        return self._fetchone_as_dict(cursor)
+
+    def get_recent_jobs(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Get recent jobs ordered by creation time."""
+        cursor = self.conn.execute(
+            "SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?", (limit,)
+        )
+        return self._fetchall_as_dicts(cursor)
+
+    def get_active_jobs(self) -> List[Dict[str, Any]]:
+        """Get all pending or running jobs."""
+        cursor = self.conn.execute(
+            "SELECT * FROM jobs WHERE status IN ('pending', 'running') ORDER BY created_at"
+        )
+        return self._fetchall_as_dicts(cursor)
+
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
+    def get_stats(self) -> Dict[str, int]:
+        """Get pipeline statistics."""
+        stats = {}
+        stats['total_podcasts'] = self.conn.execute(
+            "SELECT COUNT(*) FROM podcasts"
+        ).fetchone()[0]
+        stats['total_episodes'] = self.conn.execute(
+            "SELECT COUNT(*) FROM episodes"
+        ).fetchone()[0]
+        for status in ('downloaded', 'transcribed', 'processed'):
+            stats[f'episodes_{status}'] = self.conn.execute(
+                "SELECT COUNT(*) FROM episodes WHERE status = ?", (status,)
+            ).fetchone()[0]
+        stats['total_summaries'] = self.conn.execute(
+            "SELECT COUNT(*) FROM summaries"
+        ).fetchone()[0]
+        stats['active_jobs'] = self.conn.execute(
+            "SELECT COUNT(*) FROM jobs WHERE status IN ('pending', 'running')"
+        ).fetchone()[0]
+        return stats
 
     def close(self):
         """Close database connection."""

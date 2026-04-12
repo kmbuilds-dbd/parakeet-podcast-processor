@@ -1,6 +1,7 @@
 """Audio transcription using Whisper and Parakeet."""
 
 import json
+import logging
 import subprocess
 import tempfile
 from pathlib import Path
@@ -8,6 +9,8 @@ from typing import Dict, List, Optional, Any
 import whisper
 
 from .database import P3Database
+
+logger = logging.getLogger(__name__)
 
 # Optional Parakeet MLX support
 try:
@@ -18,136 +21,148 @@ except ImportError:
 
 
 class AudioTranscriber:
-    def __init__(self, db: P3Database, whisper_model: str = "base", 
+    def __init__(self, db: P3Database, whisper_model: str = "base",
                  use_parakeet: bool = False, parakeet_model: str = "mlx-community/parakeet-tdt-0.6b-v2"):
         self.db = db
         self.whisper_model = whisper_model
         self.use_parakeet = use_parakeet
         self.parakeet_model = parakeet_model
-        self.whisper = None
-        self.parakeet = None
-        
+        self._whisper = None
+        self._parakeet = None
+
     def _load_whisper(self):
         """Lazy load Whisper model."""
-        if self.whisper is None:
-            print(f"Loading Whisper model: {self.whisper_model}")
-            self.whisper = whisper.load_model(self.whisper_model)
+        if self._whisper is None:
+            logger.info("Loading Whisper model: %s", self.whisper_model)
+            self._whisper = whisper.load_model(self.whisper_model)
 
     def _load_parakeet(self):
         """Lazy load Parakeet MLX model."""
-        if self.parakeet is None and PARAKEET_AVAILABLE:
-            print(f"Loading Parakeet model: {self.parakeet_model}")
-            self.parakeet = parakeet_from_pretrained(self.parakeet_model)
+        if self._parakeet is None and PARAKEET_AVAILABLE:
+            logger.info("Loading Parakeet model: %s", self.parakeet_model)
+            self._parakeet = parakeet_from_pretrained(self.parakeet_model)
 
-    def transcribe_with_whisper(self, audio_path: str) -> Dict[str, Any]:
+    def unload_models(self):
+        """Release loaded models to free memory."""
+        self._whisper = None
+        self._parakeet = None
+        logger.info("Unloaded transcription models")
+
+    def transcribe_with_whisper(self, audio_path: str) -> Optional[Dict[str, Any]]:
         """Transcribe audio using OpenAI Whisper."""
         self._load_whisper()
-        
+
         try:
-            result = self.whisper.transcribe(
+            result = self._whisper.transcribe(
                 audio_path,
                 word_timestamps=True,
                 verbose=False
             )
-            
-            # Convert Whisper output to our format
+
             segments = []
             for segment in result.get('segments', []):
+                # no_speech_prob is probability of NO speech — invert for confidence
+                no_speech_prob = segment.get('no_speech_prob', 0.0)
+                confidence = 1.0 - no_speech_prob
+
                 segments.append({
                     'start': segment.get('start', 0),
                     'end': segment.get('end', 0),
                     'text': segment.get('text', '').strip(),
-                    'speaker': None,  # Whisper doesn't do speaker detection
-                    'confidence': segment.get('no_speech_prob', 0.0)
+                    'speaker': None,
+                    'confidence': confidence
                 })
-            
+
             return {
                 'segments': segments,
                 'language': result.get('language'),
                 'text': result.get('text', ''),
                 'provider': 'whisper'
             }
-            
+
         except Exception as e:
-            print(f"Whisper transcription failed: {e}")
+            logger.error("Whisper transcription failed: %s", e)
             return None
 
     def transcribe_with_parakeet(self, audio_path: str) -> Optional[Dict[str, Any]]:
         """Transcribe audio using Nvidia Parakeet MLX."""
         if not PARAKEET_AVAILABLE:
-            print("Parakeet MLX not available, falling back to Whisper")
+            logger.warning("Parakeet MLX not available, falling back to Whisper")
             return self.transcribe_with_whisper(audio_path)
-        
+
         self._load_parakeet()
-        
+
         try:
-            result = self.parakeet.transcribe(audio_path)
-            
-            # Convert Parakeet output to our format
+            result = self._parakeet.transcribe(audio_path)
+
             segments = []
             for sentence in result.sentences:
                 segments.append({
                     'start': sentence.start,
                     'end': sentence.end,
                     'text': sentence.text.strip(),
-                    'speaker': None,  # Parakeet doesn't do speaker identification
+                    'speaker': None,
                     'confidence': 1.0  # Parakeet doesn't provide confidence scores
                 })
-            
+
             return {
                 'segments': segments,
                 'language': 'en',  # Parakeet is English-only
                 'text': result.text,
                 'provider': 'parakeet-mlx'
             }
-            
+
         except Exception as e:
-            print(f"Parakeet transcription failed: {e}")
-            print("Falling back to Whisper")
+            logger.error("Parakeet transcription failed: %s", e)
+            logger.info("Falling back to Whisper")
             return self.transcribe_with_whisper(audio_path)
 
     def transcribe_episode(self, episode_id: int) -> bool:
         """Transcribe a single episode and store results."""
-        episodes = self.db.get_episodes_by_status('downloaded')
-        episode = next((ep for ep in episodes if ep['id'] == episode_id), None)
-        
+        episode = self.db.get_episode_by_id(episode_id)
+
         if not episode:
-            print(f"Episode {episode_id} not found or already processed")
+            logger.warning("Episode %d not found", episode_id)
+            return False
+
+        if episode['status'] != 'downloaded':
+            logger.warning("Episode %d has status '%s', expected 'downloaded'",
+                           episode_id, episode['status'])
             return False
 
         if not episode['file_path'] or not Path(episode['file_path']).exists():
-            print(f"Audio file not found: {episode.get('file_path')}")
+            logger.error("Audio file not found: %s", episode.get('file_path'))
             return False
 
-        print(f"Transcribing: {episode['title']}")
-        
+        logger.info("Transcribing: %s", episode['title'])
+
         # Choose transcription method
         if self.use_parakeet:
             result = self.transcribe_with_parakeet(episode['file_path'])
         else:
             result = self.transcribe_with_whisper(episode['file_path'])
-        
+
         if not result:
             return False
 
         # Store transcript segments in database
         self.db.add_transcript_segments(episode_id, result['segments'])
-        
+
         # Update episode status
         self.db.update_episode_status(episode_id, 'transcribed')
-        
-        print(f"✓ Transcribed: {episode['title']}")
+
+        logger.info("Transcribed: %s", episode['title'])
         return True
 
     def transcribe_all_pending(self) -> int:
         """Transcribe all episodes with 'downloaded' status."""
         episodes = self.db.get_episodes_by_status('downloaded')
         transcribed_count = 0
-        
+
         for episode in episodes:
             if self.transcribe_episode(episode['id']):
                 transcribed_count += 1
-            
+
         return transcribed_count
 
     def get_full_transcript(self, episode_id: int) -> str:
@@ -158,10 +173,10 @@ class AudioTranscriber:
     def export_transcript(self, episode_id: int, format: str = "txt") -> str:
         """Export transcript in various formats."""
         segments = self.db.get_transcripts_for_episode(episode_id)
-        
+
         if format == "txt":
             return "\n".join(segment['text'] for segment in segments)
-        
+
         elif format == "srt":
             srt_content = []
             for i, segment in enumerate(segments, 1):
@@ -169,10 +184,10 @@ class AudioTranscriber:
                 end_time = self._seconds_to_srt_time(segment['timestamp_end'] or 0)
                 srt_content.append(f"{i}\n{start_time} --> {end_time}\n{segment['text']}\n")
             return "\n".join(srt_content)
-        
+
         elif format == "json":
             return json.dumps(segments, indent=2, default=str)
-        
+
         else:
             raise ValueError(f"Unsupported format: {format}")
 

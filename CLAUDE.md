@@ -78,6 +78,79 @@ uvicorn p3.api.main:app                    # Serves both API and frontend
 
 **Frontend** (`frontend/`): React SPA with pages for Dashboard, Add Podcast, Podcast Detail, Episode Detail (with transcript/summary tabs), Blog Posts, and Settings. Job progress polling via `useJobPoller` hook. API client in `src/api/client.js`.
 
+## Testing
+
+### Prerequisites
+
+```bash
+python3 -m venv venv && source venv/bin/activate
+pip install -e ".[dev,web]"   # [web] needed for API tests (FastAPI, httpx, pydantic)
+```
+
+No external services (Ollama, OpenAI, ffmpeg, etc.) are required — tests use mocks, fallbacks, or direct instantiation with `db=None`.
+
+### Running Tests
+
+```bash
+# All tests
+PYTHONPATH=. pytest tests/ -v
+
+# Single file
+PYTHONPATH=. pytest tests/test_database.py -v
+
+# Single test by name
+PYTHONPATH=. pytest tests/ -k "test_add_podcast" -v
+
+# With short traceback on failure
+PYTHONPATH=. pytest tests/ -v --tb=short
+```
+
+### Test Files
+
+| File | Module | What's tested |
+|---|---|---|
+| `test_database.py` | `database.py` | Podcast/episode/transcript/summary CRUD, context manager, row-to-dict mapping |
+| `test_api.py` | `p3/api/` | All FastAPI endpoints (podcasts, episodes, jobs, transcripts, summaries, blogs, settings) via `TestClient` |
+| `test_cleaner.py` | `cleaner.py` | `_truncate_transcript`, `_extract_json`, `_basic_extraction` fallback, filler word removal |
+| `test_exporter.py` | `exporter.py` | Markdown/JSON/HTML export formatting, HTML escaping, export file paths |
+| `test_writer.py` | `writer.py` | `_parse_grade`, `_parse_numbered_list`, `_generate_slug`, `_build_context` |
+| `test_downloader.py` | `downloader.py` | `_safe_filename` utility only |
+
+### Writing Tests — Conventions
+
+- **Flat structure**: all test files go in `tests/` (no subdirectories).
+- **No conftest.py**: fixtures are defined in each test file.
+- **Database fixtures**: create a temp DuckDB in `/tmp`, clean up after each test. Example from `test_database.py`:
+  ```python
+  @pytest.fixture
+  def db(tmp_path):
+      db_path = str(tmp_path / "test.duckdb")
+      database = P3Database(db_path)
+      database.initialize()
+      yield database
+      database.close()
+  ```
+- **API tests**: patch `p3.api.deps` to swap in a temp database **before** importing the app, then use `TestClient`. An auto-use `_reset_db` fixture cleans state between tests.
+- **Module tests without DB**: instantiate with `db=None` when testing pure utility functions (e.g., `TranscriptCleaner(db=None, llm_provider="ollama")`).
+- **No mocking of external services**: tests focus on pure/deterministic functions. LLM and transcription integration paths are not unit-tested.
+
+### Linting & Type Checking
+
+```bash
+black .             # Code formatting (line-length 88)
+isort .             # Import sorting (profile: black)
+mypy p3/            # Static type checking
+```
+
+### Coverage Gaps (not currently tested)
+
+- `cli.py` — Click command orchestration
+- `transcriber.py` — Whisper/Parakeet MLX integration
+- `downloader.py` — RSS parsing, audio download, ffmpeg normalization (only `_safe_filename` is tested)
+- LLM integration paths in `cleaner.py` and `writer.py` (Ollama/OpenAI calls)
+- Frontend React components (no test framework installed)
+- End-to-end pipeline (fetch → transcribe → digest → export)
+
 ## Configuration
 
 `config/feeds.yaml` controls feeds and all settings. Key settings:

@@ -33,17 +33,24 @@ def get_podcast(podcast_id: int):
 
 @router.post("", response_model=dict)
 def add_podcast(body: PodcastCreate, background_tasks: BackgroundTasks):
-    """Add a podcast by RSS URL and start fetching episodes."""
+    """Add a podcast by RSS feed URL or Apple Podcasts link and start fetching episodes."""
     db = get_db()
 
+    # Resolve non-RSS URLs (e.g. Apple Podcasts) to an RSS feed
+    from p3.url_resolver import resolve_podcast_url
+    try:
+        rss_url, resolved_name = resolve_podcast_url(body.url)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
     # Check if already exists
-    existing = db.get_podcast_by_url(body.url)
+    existing = db.get_podcast_by_url(rss_url)
     if existing:
         raise HTTPException(409, "Podcast with this URL already exists")
 
-    # Use provided name or derive from URL
-    name = body.name or body.url.split("/")[-1] or "Untitled Podcast"
-    podcast_id = db.add_podcast(name, body.url, body.category)
+    # Use provided name, resolved name from lookup, or derive from URL
+    name = body.name or resolved_name or rss_url.split("/")[-1] or "Untitled Podcast"
+    podcast_id = db.add_podcast(name, rss_url, body.category)
 
     # Kick off fetch in background
     job_id = db.create_job("fetch", episode_id=None)

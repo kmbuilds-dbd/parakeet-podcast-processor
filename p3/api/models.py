@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 # ------------------------------------------------------------------
 
 class PodcastCreate(BaseModel):
-    url: str = Field(..., description="RSS feed URL")
+    url: str = Field(..., description="RSS feed URL or Apple Podcasts link")
     name: Optional[str] = Field(None, description="Display name (auto-detected from feed if omitted)")
     category: Optional[str] = None
 

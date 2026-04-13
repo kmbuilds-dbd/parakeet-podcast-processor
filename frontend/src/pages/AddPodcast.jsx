@@ -40,15 +40,18 @@ export default function AddPodcast() {
 
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1">RSS Feed URL *</label>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Podcast URL *</label>
           <input
             type="url"
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             required
-            placeholder="https://example.com/feed.xml"
+            placeholder="RSS feed or Apple Podcasts link"
             className="w-full border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
           />
+          <p className="mt-1 text-xs text-gray-500">
+            Paste an RSS feed URL or an Apple Podcasts link (e.g. podcasts.apple.com/...)
+          </p>
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700 mb-1">Name (optional)</label>
